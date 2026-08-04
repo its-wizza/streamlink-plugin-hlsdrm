@@ -34,7 +34,10 @@ The plugin accepts a number of optional parameters:
   </TR>
   <TR>
     <TD>--hlsdrm-decryption-key &ltkey in hex or base64&gt</TD>
-    <TD>This is a comma seperated list of decryption keys to be passed to ffmpeg. If only one key is given, then all streams will use this key. If 2 keys are given, then the video stream will use the first key, and all remaining streams (eg audio streams) will use the second key. If more than 2 keys are given, then the video stream will use the first key, and the second stream will use the second key, the third stream will use the third key etc. If more streams than keys are given, keys will be looped starting with the second key. The keys need to be in hex or base64, either just the key by itself, or in the format of kid:key (although the kid is not used)</TD>
+    <TD>This is a comma-separated list of decryption keys to be passed to ffmpeg. Keys may be supplied either as key or kid:key. If one or more KIDs are supplied, dashdrm will automatically match keys to representations using their KIDs, allowing keys to be supplied in any order. If KID matching cannot be completed, or no KIDs are supplied, keys are assigned to streams by position:
+    <LI>If only one key is given, all streams use that key.</LI>
+    <LI>If two keys are given, the video stream uses the first key and all remaining streams (for example audio streams) use the second key.</LI>
+    <LI>If more than two keys are given, the video stream uses the first key and subsequent streams use the remaining keys in order. If there are more streams than keys, assignment wraps back to the second key.</LI></TD>
   </TR>
 
 </TABLE>
