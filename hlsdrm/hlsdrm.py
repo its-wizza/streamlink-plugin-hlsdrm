@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import binascii
 import re
 import base64
+from dataclasses import dataclass, replace, asdict
 
 from typing import Literal, Self, ClassVar
+from urllib.parse import urlsplit
+
 from requests import Response
+from streamlink import validate
 
 from streamlink.exceptions import PluginError, FatalPluginError
 from streamlink.logger import getLogger
@@ -13,19 +18,24 @@ from streamlink.plugin.plugin import LOW_PRIORITY, parse_params
 from streamlink.session import Streamlink
 from streamlink.stream.ffmpegmux import FFMPEGMuxer
 from streamlink.stream.hls import (HLSStream,
-                                    HLSStreamReader,
-                                    HLSStreamWriter,
-                                    HLSStreamWorker,
-                                    MuxedHLSStream)
-from streamlink.stream.hls.segment import HLSSegment, HLSPlaylist
-from streamlink.stream.hls.m3u8 import M3U8Parser, M3U8
+                                   HLSStreamReader,
+                                   HLSStreamWriter,
+                                   HLSStreamWorker,
+                                   MuxedHLSStream, M3U8, M3U8Parser, parse_tag)
+from streamlink.stream.hls.segment import HLSSegment, Key, HLSPlaylist
 from streamlink.utils.url import update_scheme
-
 
 log = getLogger(__name__)
 
 WIDEVINE_SYSTEM_ID = bytes.fromhex("edef8ba979d64acea3c827dcd51d21ed")
 ZERO_KID = "00000000000000000000000000000000"
+UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{12}"
+)
 
 HLSDRM_OPTIONS = [
     "decryption-key",
@@ -171,6 +181,23 @@ class FFMPEGMuxerDRM(FFMPEGMuxer):
         #self._cmd.extend(["-report"])
         log.debug("Updated ffmpeg command %s", self._cmd)
 
+@dataclass(kw_only=True)
+class KeyDRM(Key):
+    key_id: str | None = None
+
+class M3U8ParserDRM(M3U8Parser):
+    @parse_tag("EXT-X-KEY")
+    def parse_tag_ext_x_key(self, value: str) -> None:
+        super().parse_tag_ext_x_key(value)
+
+        if self._key:
+            attr = self.parse_attributes(value)
+
+            self._key = KeyDRM(
+                **asdict(self._key),
+                key_id=attr.get("KEYID"),
+            )
+
 class HLSStreamWriterDRM(HLSStreamWriter):
     reader: HLSStreamReaderDRM
     stream: HLSStreamDRM
@@ -198,6 +225,7 @@ class HLSStreamReaderDRM(HLSStreamReader):
 class HLSStreamDRM(HLSStream):
     __shortname__ = "hlsdrm"
     __reader__: ClassVar[type[HLSStreamReaderDRM]] = HLSStreamReaderDRM
+    __parser__: ClassVar[type[M3U8Parser[M3U8[HLSSegment, HLSPlaylist], HLSSegment, HLSPlaylist]]] = M3U8ParserDRM
 
     @classmethod
     def parse_variant_playlist(
@@ -304,7 +332,12 @@ class MuxedHLSStreamDRM(MuxedHLSStream):
         rtn_keys = []
 
         for reader in readers:
-            kid = self._find_stream_kid(reader)
+            playlist = self._fetch_playlist(self.session, reader.stream.url)
+
+            if playlist is None:
+                return positional_match()
+
+            kid = self._resolve_stream_kid(reader)
             if kid is None:
                 log.debug("Unable to determine stream KID, falling back to positional assignment")
                 return positional_match()
@@ -319,61 +352,72 @@ class MuxedHLSStreamDRM(MuxedHLSStream):
         log.debug("Successfully matched all streams by KID")
         return rtn_keys
 
-    def _find_stream_kid(self, reader):
-        playlist = self._fetch_playlist(self.session, reader.stream.url)
-
-        if playlist is None:
-            return None
-
-        for segment in playlist.segments:
-            key = segment.key
-
-            if key:
-                kid = self._extract_kid_from_skd_uri(key.uri)
-
-                if kid:
-                    log.debug("KID extracted from SKD URI: %s", kid)
-                    return kid
-
-            if not segment.map:
-                continue
-
-            uri = segment.map.uri
-            cache_key = (uri, segment.map.byterange)
-            if cache_key in self._kid_cache:
-                return self._kid_cache[cache_key]
-
-            if uri.startswith("data:"):
-                header, data = uri.split(",", 1)
-                data = base64.b64decode(data)
-            else:
-                request = self.session.http.get(uri)
-                data = request.content
-
-            if segment.map.byterange:
-                start = segment.map.byterange.offset or 0
-                end = start + segment.map.byterange.range
-                data = data[start:end]
-
-            scheme, kid = self._parse_init_segment(data)
-            if kid:
-                self._kid_cache[cache_key] = kid
-                return kid
-
-        return None
-
-    @classmethod
-    def _fetch_playlist(cls, session, url):
+    @staticmethod
+    def _fetch_playlist(session: Streamlink, url: str) -> M3U8 | None:
         try:
             res = session.http.get(url)
-
             parser = HLSStreamDRM.__parser__(url)
-
             return parser.parse(res.text)
-
         except Exception as err:
             log.debug("Unable to load playlist %s: %s", url, err)
             return None
+
+    def _resolve_stream_kid(self, playlist: M3U8) -> str | None:
+        seen_key_uris = set()
+        seen_maps = set()
+
+        for segment in playlist.segments:
+            if segment.key:
+                if getattr(segment.key, "key_id", None):
+                    return segment.key.key_id.replace("-", "").lower()
+
+                # Extract KID from EXT-X-KEY URI
+                if segment.key.uri:
+                    uri = segment.key.uri
+
+                    if uri not in seen_key_uris:
+                        seen_key_uris.add(uri)
+
+                        kid = self._extract_kid_from_key_uri(uri)
+                        if kid:
+                            log.debug("KID extracted from key URI: %s", kid)
+                            return kid
+
+            # Extract KID from init segment
+            if segment.map and segment.map.uri:
+                uri = segment.map.uri
+                cache_key = (uri, segment.map.byterange)
+
+                if cache_key in seen_maps:
+                    continue
+
+                seen_maps.add(cache_key)
+
+                if cache_key in self._kid_cache:
+                    kid = self._kid_cache[cache_key]
+                    if kid:
+                        return kid
+                    continue
+
+                if uri.startswith("data:"):
+                    _, data = uri.split(",", 1)
+                    data = base64.b64decode(data)
+                else:
+                    request = self.session.http.get(uri)
+                    data = request.content
+
+                if segment.map.byterange:
+                    start = segment.map.byterange.offset or 0
+                    end = start + segment.map.byterange.range
+                    data = data[start:end]
+
+                scheme, kid = self._parse_init_segment(data)
+
+                self._kid_cache[cache_key] = kid
+                if kid:
+                    return kid
+
+        return None
 
     @staticmethod
     def _parse_init_segment(data: bytes) -> tuple[str | None, str | None]:
@@ -418,32 +462,13 @@ class MuxedHLSStreamDRM(MuxedHLSStream):
             break
 
         if kid == ZERO_KID:
-            kid = MuxedHLSStreamDRM._extract_kid_from_pssh(data)
+            log.debug("Zero KID found in tenc, attempting PSSH fallback")
+            kid = MuxedHLSStreamDRM._extract_kid_from_pssh_box(data)
 
         return scheme, kid
 
     @staticmethod
-    def _extract_kid_from_skd_uri(uri: str | None) -> str | None:
-        if not uri:
-            return None
-
-        if not uri.lower().startswith("skd://"):
-            return None
-
-        value = uri[6:]
-
-        # skd://<kid>:<asset>
-        kid = value.split(":", 1)[0]
-
-        kid = kid.replace("-", "").lower()
-
-        if len(kid) == 32:
-            return kid
-
-        return None
-
-    @staticmethod
-    def _extract_kid_from_pssh(data: bytes) -> str | None:
+    def _extract_kid_from_pssh_box(data: bytes) -> str | None:
         pssh = data.find(b"pssh")
 
         if pssh == -1:
@@ -469,6 +494,75 @@ class MuxedHLSStreamDRM(MuxedHLSStream):
             return None
 
         return payload[2:18].hex()
+
+    @staticmethod
+    def _extract_kid_from_key_uri(uri: str) -> str | None:
+        parsed = urlsplit(uri)
+        scheme = parsed.scheme.lower()
+
+        if scheme == "skd":
+            match = UUID_RE.search(uri)
+            if match:
+                return match.group(0).replace("-", "").lower()
+
+            payload = parsed.netloc + parsed.path
+
+            try:
+                decoded = base64.b64decode(payload, validate=True)
+                schema = validate.Schema(
+                    validate.parse_json(),
+                    dict,
+                )
+                data = schema.validate(decoded)
+                return MuxedHLSStreamDRM._find_uuid(data)
+            except (ValueError, binascii.Error, PluginError):
+                pass
+
+            log.debug("Unable to extract KID from SKD URI")
+            return None
+
+        if scheme == "data":
+            try:
+                metadata, payload = parsed.path.split(",", 1)
+            except ValueError:
+                log.debug("Unable to extract KID from data URI")
+                return None
+
+            if ";base64" not in metadata.lower():
+                log.debug("Unable to extract KID from data URI")
+                return None
+
+            try:
+                decoded = base64.b64decode(payload, validate=True)
+            except (ValueError, binascii.Error):
+                log.debug("Unable to extract KID from data URI")
+                return None
+
+            return MuxedHLSStreamDRM._extract_kid_from_pssh_box(decoded)
+
+        log.debug("Unsupported key URI scheme for KID extraction: %s", scheme)
+        return None
+
+    @staticmethod
+    def _find_uuid(obj) -> str | None:
+        if isinstance(obj, str):
+            uuid_match = UUID_RE.fullmatch(obj)
+            if uuid_match:
+                return uuid_match.group(0).replace("-", "").lower()
+
+        elif isinstance(obj, list):
+            for item in obj:
+                kid = MuxedHLSStreamDRM._find_uuid(item)
+                if kid:
+                    return kid
+
+        elif isinstance(obj, dict):
+            for value in obj.values():
+                kid = MuxedHLSStreamDRM._find_uuid(value)
+                if kid:
+                    return kid
+
+        return None
 
     def open(self):
         fds = []
@@ -498,6 +592,5 @@ class MuxedHLSStreamDRM(MuxedHLSStream):
         self.options["keys"] = keys
 
         return FFMPEGMuxerDRM(self.session, *fds, **self.options).open()
-
 
 __plugin__ = HLSPluginDRM
