@@ -337,7 +337,7 @@ class MuxedHLSStreamDRM(MuxedHLSStream):
             if playlist is None:
                 return positional_match()
 
-            kid = self._resolve_stream_kid(reader)
+            kid = self._resolve_stream_kid(playlist)
             if kid is None:
                 log.debug("Unable to determine stream KID, falling back to positional assignment")
                 return positional_match()
